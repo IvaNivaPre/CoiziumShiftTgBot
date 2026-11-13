@@ -2,7 +2,7 @@ import asyncpg
 import os
 from datetime import datetime
 
-DATABASE_URL = os.getenv("postgresql://neondb_owner:********@ep-cool-lab-batuu9sm.c-8.eu-central-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 async def init_db():
     conn = await asyncpg.connect(DATABASE_URL)
