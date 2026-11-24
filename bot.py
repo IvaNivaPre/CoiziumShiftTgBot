@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 import logging
 import os
 from aiohttp import web
@@ -6,7 +7,14 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.fsm.storage.memory import SimpleEventIsolation
+from aiogram.types import (
+    InputMediaDocument,
+    InputMediaPhoto,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 
 from database import init_db, save_shift, get_shifts_by_date
 
@@ -14,7 +22,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(events_isolation=SimpleEventIsolation())
+
+SAVE_REPORT_BTN = "Сохранить отчёт"
+_album_reply_tasks: dict[tuple[int, int, str], asyncio.Task] = {}
 
 
 zero_kb = ReplyKeyboardMarkup(
@@ -27,6 +38,11 @@ none_kb = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="Нет / Без происшествий")]],
     resize_keyboard=True,
     one_time_keyboard=True
+)
+
+photos_kb = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text=SAVE_REPORT_BTN)]],
+    resize_keyboard=True
 )
 
 
@@ -50,6 +66,7 @@ class ShiftForm(StatesGroup):
     conflicts = State()
     bar_ending = State()
     completed_tasks = State()
+    photos = State()
 
 
 class ReportSearch(StatesGroup):
@@ -63,7 +80,49 @@ def parse_float(text: str) -> float | None:
         return None
 
 
+def parse_media_item(item: str) -> tuple[str, str]:
+    """Return ('photo' | 'doc', file_id) from a stored media entry."""
+    if item.startswith("doc:"):
+        return "doc", item[4:]
+    if item.startswith("photo:"):
+        return "photo", item[6:]
+    return "photo", item
+
+
+async def send_shift_photos(message: types.Message, photos: list[str]) -> None:
+    """Send stored shift photos (and image documents) grouped into Telegram media batches."""
+    if not photos:
+        return
+
+    batches: list[tuple[str, list[str]]] = []
+    for raw_item in photos:
+        kind, file_id = parse_media_item(raw_item)
+        if not batches or batches[-1][0] != kind or len(batches[-1][1]) >= 10:
+            batches.append((kind, [file_id]))
+        else:
+            batches[-1][1].append(file_id)
+
+    try:
+        for kind, file_ids in batches:
+            if len(file_ids) == 1:
+                if kind == "doc":
+                    await message.answer_document(file_ids[0])
+                else:
+                    await message.answer_photo(file_ids[0])
+            else:
+                media = [
+                    InputMediaDocument(media=fid) if kind == "doc" else InputMediaPhoto(media=fid)
+                    for fid in file_ids
+                ]
+                await message.answer_media_group(media)
+    except Exception:
+        logging.exception("Failed to send shift photos")
+        await message.answer("⚠️ Не удалось загрузить некоторые фотографии.")
+
+
 def format_report_text(data: dict, date_str: str) -> str:
+    photos = data.get("photos") or []
+    photos_label = f"{len(photos)} шт." if photos else "Нет"
     return (
         f"📊 <b>ОТЧЁТ ЗА СМЕНУ ({date_str})</b>\n\n"
         f"<b>Администратор:</b> {data['admin_info']}\n"
@@ -86,7 +145,8 @@ def format_report_text(data: dict, date_str: str) -> str:
         f"Поломки: {data['breakdowns']}\n"
         f"Конфликты (что произошло / как решили): {data['conflicts']}\n"
         f"Бар (что заканчивается): {data['bar_ending']}\n"
-        f"Выполненные задачи: {data['completed_tasks']}"
+        f"Выполненные задачи: {data['completed_tasks']}\n"
+        f"Фотографии: {photos_label}"
     )
 
 
@@ -288,22 +348,106 @@ async def process_bar_ending(message: types.Message, state: FSMContext):
     await message.answer("Введите <b>Выполненные задачи</b>:", parse_mode="HTML", reply_markup=none_kb)
 
 
+async def _notify_album_added(
+    message: types.Message,
+    state: FSMContext,
+    key: tuple[int, int, str],
+) -> None:
+    try:
+        await asyncio.sleep(0.6)
+        if await state.get_state() != ShiftForm.photos.state:
+            return
+        data = await state.get_data()
+        count = len(data.get("photos") or [])
+        await message.answer(
+            f"📸 Фотографии добавлены (всего: {count}). "
+            f"Отправьте ещё или нажмите <b>«{SAVE_REPORT_BTN}»</b>:",
+            parse_mode="HTML",
+            reply_markup=photos_kb,
+        )
+    except asyncio.CancelledError:
+        return
+    finally:
+        if _album_reply_tasks.get(key) is asyncio.current_task():
+            _album_reply_tasks.pop(key, None)
+
+
+async def _append_media_and_reply(
+    message: types.Message,
+    state: FSMContext,
+    media_item: str,
+) -> None:
+    data = await state.get_data()
+    photos = list(data.get("photos") or [])
+    photos.append(media_item)
+    await state.update_data(photos=photos)
+
+    if message.media_group_id:
+        user_id = message.from_user.id if message.from_user else 0
+        key = (message.chat.id, user_id, message.media_group_id)
+        prev_task = _album_reply_tasks.pop(key, None)
+        if prev_task and not prev_task.done():
+            prev_task.cancel()
+        _album_reply_tasks[key] = asyncio.create_task(
+            _notify_album_added(message, state, key)
+        )
+        return
+
+    await message.answer(
+        f"📸 Фото добавлено (всего: {len(photos)}). "
+        f"Отправьте ещё или нажмите <b>«{SAVE_REPORT_BTN}»</b>:",
+        parse_mode="HTML",
+        reply_markup=photos_kb,
+    )
+
+
 @dp.message(ShiftForm.completed_tasks)
 async def process_completed_tasks(message: types.Message, state: FSMContext):
-    await state.update_data(completed_tasks=message.text)
-    data = await state.get_data()
+    if not message.text:
+        return await message.answer("Пожалуйста, введите текстовый ответ (выполненные задачи):")
+    await state.update_data(completed_tasks=message.text, photos=[])
+    await state.set_state(ShiftForm.photos)
+    await message.answer(
+        f"📸 Загрузите <b>фотографии</b> за смену (можно отправить одну или несколько).\n"
+        f"Когда закончите (или если фото не требуются), нажмите <b>«{SAVE_REPORT_BTN}»</b>:",
+        parse_mode="HTML",
+        reply_markup=photos_kb
+    )
 
+
+@dp.message(ShiftForm.photos, F.text == SAVE_REPORT_BTN)
+async def process_photos_done(message: types.Message, state: FSMContext):
+    data = await state.get_data()
     await save_shift(data)
 
-    from datetime import datetime
     today_str = datetime.now().strftime("%d.%m.%Y")
     report = format_report_text(data, today_str)
 
     await state.clear()
-    await message.answer("✅ <b>Смена успешно закрыта и сохранена в базу!</b>\n\n" + report, parse_mode="HTML",
-                         reply_markup=ReplyKeyboardRemove())
+    await message.answer(
+        "✅ <b>Смена успешно закрыта и сохранена в базу!</b>\n\n" + report,
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
+@dp.message(ShiftForm.photos, F.photo)
+async def process_shift_photo(message: types.Message, state: FSMContext):
+    await _append_media_and_reply(message, state, f"photo:{message.photo[-1].file_id}")
+
+
+@dp.message(ShiftForm.photos, F.document, F.document.mime_type.startswith("image/"))
+async def process_shift_photo_document(message: types.Message, state: FSMContext):
+    await _append_media_and_reply(message, state, f"doc:{message.document.file_id}")
+
+
+@dp.message(ShiftForm.photos)
+async def process_photos_invalid(message: types.Message):
+    await message.answer(
+        f"Пожалуйста, отправьте фотографию или нажмите кнопку <b>«{SAVE_REPORT_BTN}»</b>.",
+        parse_mode="HTML",
+        reply_markup=photos_kb,
+    )
 
 
 @dp.message(Command("report"))
@@ -330,8 +474,12 @@ async def process_report_date(message: types.Message, state: FSMContext):
         return await message.answer(f"За дату <b>{date_text}</b> отчётов не найдено.", parse_mode="HTML")
 
     for row in rows:
-        report = format_report_text(dict(row), date_text)
+        row_dict = dict(row)
+        report = format_report_text(row_dict, date_text)
         await message.answer(report, parse_mode="HTML")
+        photos = row_dict.get("photos") or []
+        if photos:
+            await send_shift_photos(message, photos)
 
 
 async def health_check(request):
